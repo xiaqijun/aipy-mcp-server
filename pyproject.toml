@@ -1,0 +1,12 @@
+[project]
+name = "aipy-mcp-server"
+version = "0.1.0"
+description = "MCP Server wrapping AiPyPro — AI-powered Python task execution (No Agents, Code is Agent)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.0.0",
+]
+
+[project.scripts]
+aipy-mcp = "server:main"
