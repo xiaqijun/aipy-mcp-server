@@ -36,23 +36,26 @@ def _find_aipypro() -> str:
 
     检测顺序:
         1. 环境变量 AIPYPRO_PATH
-        2. AiPyPro 安装目录下的 bin/aipypro.exe
-        3. 系统 PATH 中的 aipypro / aipypro.exe
+        2. 文件系统搜索（Windows 各盘符 / macOS / Linux 常见路径）
+        3. 从 AiPyPro 配置文件推断
+        4. 系统 PATH
     """
+    # 1. 环境变量
     env_path = os.environ.get("AIPYPRO_PATH")
     if env_path and Path(env_path).exists():
         return env_path
 
-    # AiPyPro 默认安装位置
-    candidates = [
-        r"E:\aipy\AiPyPro\resources\app.asar.unpacked\resources\bin\aipypro.exe",
-        r"C:\Program Files\AiPyPro\resources\app.asar.unpacked\resources\bin\aipypro.exe",
-    ]
-    for c in candidates:
-        if Path(c).exists():
-            return c
+    # 2. 文件系统搜索
+    found = _search_filesystem()
+    if found:
+        return found
 
-    # 尝试系统 PATH
+    # 3. 从 AiPyPro 配置推断
+    found = _find_from_config()
+    if found:
+        return found
+
+    # 4. 系统 PATH
     for cmd in ["aipypro.exe", "aipypro"]:
         try:
             result = subprocess.run(
@@ -69,6 +72,140 @@ def _find_aipypro() -> str:
         "请设置环境变量 AIPYPRO_PATH 指向 aipypro.exe，\n"
         "或安装 AiPyPro: https://www.aipy.app/"
     )
+
+
+def _search_filesystem() -> str | None:
+    """在常见位置搜索 aipypro。"""
+    exe_name = "aipypro.exe" if sys.platform == "win32" else "aipypro"
+
+    if sys.platform == "win32":
+        return _search_windows(exe_name)
+    elif sys.platform == "darwin":
+        return _search_macos(exe_name)
+    else:
+        return _search_linux(exe_name)
+
+
+def _search_windows(exe_name: str) -> str | None:
+    """Windows: 在所有盘符下搜索 AiPyPro 安装目录。"""
+    import string
+
+    # 常见子路径模式
+    sub_path = r"resources\app.asar.unpacked\resources\bin"
+
+    for drive in string.ascii_uppercase:
+        root = f"{drive}:\\"
+        if not Path(root).exists():
+            continue
+
+        # 精确匹配：<drive>:\aipy\AiPyPro\resources\...\bin\aipypro.exe
+        candidate = Path(root) / "aipy" / "AiPyPro" / sub_path / exe_name
+        if candidate.exists():
+            return str(candidate)
+
+        # 搜索 *AiPyPro* 目录
+        try:
+            drive_root = Path(root)
+            for entry in drive_root.iterdir():
+                if not entry.is_dir():
+                    continue
+                name = entry.name.lower()
+                if "aipy" in name:
+                    candidate = entry / sub_path / exe_name
+                    if candidate.exists():
+                        return str(candidate)
+        except PermissionError:
+            continue
+
+        # 深度搜索（仅在 Program Files 和用户目录下）
+        for base in [
+            rf"{drive}:\Program Files",
+            rf"{drive}:\Program Files (x86)",
+            rf"{drive}:\Users",
+        ]:
+            base_path = Path(base)
+            if not base_path.exists():
+                continue
+            try:
+                for p in base_path.rglob(f"**/{exe_name}"):
+                    if "AiPyPro" in str(p) or "aipy" in str(p).lower():
+                        return str(p)
+            except PermissionError:
+                continue
+
+    return None
+
+
+def _search_macos(exe_name: str) -> str | None:
+    """macOS: 搜索 Applications 目录。"""
+    sub_path = "Contents/Resources/app.asar.unpacked/resources/bin"
+    candidates = [
+        Path(f"/Applications/AiPyPro.app/{sub_path}/{exe_name}"),
+        Path.home() / f"Applications/AiPyPro.app/{sub_path}/{exe_name}",
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+
+    # 通配搜索
+    for base in [Path("/Applications"), Path.home() / "Applications"]:
+        if not base.exists():
+            continue
+        try:
+            for p in base.rglob(f"*AiPyPro*/{sub_path}/{exe_name}"):
+                return str(p)
+        except PermissionError:
+            continue
+
+    return None
+
+
+def _search_linux(exe_name: str) -> str | None:
+    """Linux: 搜索常见安装目录。"""
+    candidates = [
+        f"/opt/AiPyPro/resources/app.asar.unpacked/resources/bin/{exe_name}",
+        f"/usr/local/bin/{exe_name}",
+        f"/usr/local/share/AiPyPro/resources/app.asar.unpacked/resources/bin/{exe_name}",
+    ]
+    for c in candidates:
+        if Path(c).exists():
+            return c
+
+    # 搜索 home 目录
+    home = Path.home()
+    for pattern in [".local/bin", "Applications", "apps"]:
+        base = home / pattern
+        if not base.exists():
+            continue
+        try:
+            for p in base.rglob(f"**/{exe_name}"):
+                if "aipy" in str(p).lower():
+                    return str(p)
+        except PermissionError:
+            continue
+
+    return None
+
+
+def _find_from_config() -> str | None:
+    """从 AiPyPro 配置文件中推断安装路径。"""
+    config_dir = Path.home() / ".aipyapp"
+    if not config_dir.exists():
+        return None
+
+    # 从日志中提取路径信息
+    log_file = config_dir / "aipyapp.log"
+    if log_file.exists():
+        try:
+            content = log_file.read_text(encoding="utf-8", errors="ignore")
+            import re
+            match = re.search(r'([A-Za-z]:[^"\'\s]*aipypro\.exe)', content)
+            if match and Path(match.group(1)).exists():
+                return match.group(1)
+        except Exception:
+            pass
+
+    return None
 
 
 AIPYPRO = _find_aipypro()

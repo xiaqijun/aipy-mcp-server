@@ -44,14 +44,14 @@ uv sync
 {
   "mcpServers": {
     "aipy": {
-      "command": "aipy-mcp",
-      "env": {
-        "AIPYPRO_PATH": "E:/aipy/AiPyPro/resources/app.asar.unpacked/resources/bin/aipypro.exe"
-      }
+      "command": "aipy-mcp"
     }
   }
 }
 ```
+
+> `AIPYPRO_PATH` 无需手动配置。服务器会自动在所有盘符和常见路径中搜索 `aipypro.exe`。
+> 仅在自动检测失败时才需要设置 `env.AIPYPRO_PATH`。
 
 如果使用 uvx 免安装（替换上面的 command/args）：
 
@@ -60,10 +60,7 @@ uv sync
   "mcpServers": {
     "aipy": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/xiaqijun/aipy-mcp-server.git", "aipy-mcp"],
-      "env": {
-        "AIPYPRO_PATH": "E:/aipy/AiPyPro/resources/app.asar.unpacked/resources/bin/aipypro.exe"
-      }
+      "args": ["--from", "git+https://github.com/xiaqijun/aipy-mcp-server.git", "aipy-mcp"]
     }
   }
 }
@@ -76,10 +73,7 @@ uv sync
   "mcpServers": {
     "aipy": {
       "command": "uv",
-      "args": ["run", "--directory", "E:/github/aipy-mcp-server", "python", "server.py"],
-      "env": {
-        "AIPYPRO_PATH": "E:/aipy/AiPyPro/resources/app.asar.unpacked/resources/bin/aipypro.exe"
-      }
+      "args": ["run", "--directory", "E:/github/aipy-mcp-server", "python", "server.py"]
     }
   }
 }
