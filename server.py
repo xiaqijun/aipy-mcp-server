@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 """
-AiPy MCP Server — 将 AiPyPro 的 AI 任务执行能力暴露为 MCP 工具。
+AiPy MCP Server — 直接集成 AiPyPro 源码，暴露 AI 任务执行能力为 MCP 工具。
 
-通过 stdio 与 MCP 客户端（如 Claude Code）通信，
-内部调用 aipypro.exe 执行任务。
+与旧版的区别:
+- 旧版: 通过 subprocess 调用 aipypro.exe
+- 新版: 直接 import aipyapp，零开销调用 AI-PY 内核
 
 用法:
     uv run python server.py
-    # 或安装后:
-    aipy-mcp
 
 环境变量:
-    AIPYPRO_PATH     — aipypro.exe 的路径（默认自动检测）
-    AIPYPRO_TIMEOUT  — 任务超时秒数（默认 300）
+    AIPYAPP_PATH       — aipyapp 源码目录 (必需)
+    AIPYAPP_CONFIG_DIR — AiPyPro 配置目录 (默认 ~/.aipyapp)
+    AIPYAPP_PROVIDER   — LLM provider JSON (默认从 AiPyPro 配置读取)
+    AIPYAPP_TIMEOUT    — 任务超时秒数 (默认 600)
 """
+
+from __future__ import annotations
 
 import asyncio
 import os
-import subprocess
 import sys
+import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -26,190 +30,787 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-
 # ---------------------------------------------------------------------------
-# 配置 — 自动检测 aipypro.exe
+# 源码路径解析
 # ---------------------------------------------------------------------------
 
-def _find_aipypro() -> str:
-    """自动检测 aipypro.exe 路径。
+# Electron app 内 aipyapp 源码的相对路径
+_AIPYAPP_SUB = Path("resources/app.asar.unpacked/resources/aipyapp")
 
-    检测顺序:
-        1. 环境变量 AIPYPRO_PATH
-        2. 文件系统搜索（Windows 各盘符 / macOS / Linux 常见路径）
-        3. 从 AiPyPro 配置文件推断
-        4. 系统 PATH
+
+def _resolve_aipyapp_path() -> Path:
+    """解析 aipyapp 源码目录（返回包含 aipyapp/__init__.py 的父目录）。
+
+    检测顺序 (任一命中即返回):
+        1. 环境变量 AIPYAPP_PATH
+        2. pip 安装的 aipyapp 包 (importlib)
+        3. ~/.aipyapp 日志/配置中的路径线索
+        4. Windows / WSL 常见安装位置遍历
     """
     # 1. 环境变量
-    env_path = os.environ.get("AIPYPRO_PATH")
-    if env_path and Path(env_path).exists():
-        return env_path
+    env = os.environ.get("AIPYAPP_PATH", "")
+    if env:
+        p = Path(env).expanduser().resolve()
+        if (p / "aipyapp" / "__init__.py").exists():
+            return p
+        if (p / "__init__.py").exists() and p.name == "aipyapp":
+            return p.parent
 
-    # 2. 文件系统搜索
+    # 2. pip 安装
+    found = _find_pip()
+    if found:
+        return found
+
+    # 3. 配置文件/日志线索
+    found = _find_from_aipy_config()
+    if found:
+        return found
+
+    # 4. 系统搜索
     found = _search_filesystem()
     if found:
         return found
 
-    # 3. 从 AiPyPro 配置推断
-    found = _find_from_config()
-    if found:
-        return found
-
-    # 4. 系统 PATH
-    for cmd in ["aipypro.exe", "aipypro"]:
-        try:
-            result = subprocess.run(
-                [cmd, "--help"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if "Python use" in (result.stdout + result.stderr):
-                return cmd
-        except Exception:
-            pass
-
     raise FileNotFoundError(
-        "找不到 aipypro.exe。\n"
-        "请设置环境变量 AIPYPRO_PATH 指向 aipypro.exe，\n"
-        "或安装 AiPyPro: https://www.aipy.app/"
+        "找不到 aipyapp 源码目录。\n"
+        "请设置环境变量 AIPYAPP_PATH 指向 aipyapp 源码目录，或安装 AiPyPro。\n"
+        "示例: AIPYAPP_PATH=E:/aipy/AiPyPro/resources/app.asar.unpacked/resources/aipyapp\n"
+        "下载: https://www.aipy.app/"
     )
 
 
-def _search_filesystem() -> str | None:
-    """在常见位置搜索 aipypro。"""
-    exe_name = "aipypro.exe" if sys.platform == "win32" else "aipypro"
-
-    if sys.platform == "win32":
-        return _search_windows(exe_name)
-    elif sys.platform == "darwin":
-        return _search_macos(exe_name)
-    else:
-        return _search_linux(exe_name)
+def _is_aipyapp_root(p: Path) -> bool:
+    """检查路径是否包含 aipyapp/__init__.py。"""
+    return (p / "aipyapp" / "__init__.py").exists()
 
 
-def _search_windows(exe_name: str) -> str | None:
-    """Windows: 在所有盘符下搜索 AiPyPro 安装目录。"""
-    import string
-
-    # 常见子路径模式
-    sub_path = r"resources\app.asar.unpacked\resources\bin"
-
-    for drive in string.ascii_uppercase:
-        root = f"{drive}:\\"
-        if not Path(root).exists():
-            continue
-
-        # 精确匹配：<drive>:\aipy\AiPyPro\resources\...\bin\aipypro.exe
-        candidate = Path(root) / "aipy" / "AiPyPro" / sub_path / exe_name
-        if candidate.exists():
-            return str(candidate)
-
-        # 搜索 *AiPyPro* 目录
-        try:
-            drive_root = Path(root)
-            for entry in drive_root.iterdir():
-                if not entry.is_dir():
-                    continue
-                name = entry.name.lower()
-                if "aipy" in name:
-                    candidate = entry / sub_path / exe_name
-                    if candidate.exists():
-                        return str(candidate)
-        except PermissionError:
-            continue
-
-        # 深度搜索（仅在 Program Files 和用户目录下）
-        for base in [
-            rf"{drive}:\Program Files",
-            rf"{drive}:\Program Files (x86)",
-            rf"{drive}:\Users",
-        ]:
-            base_path = Path(base)
-            if not base_path.exists():
-                continue
-            try:
-                for p in base_path.rglob(f"**/{exe_name}"):
-                    if "AiPyPro" in str(p) or "aipy" in str(p).lower():
-                        return str(p)
-            except PermissionError:
-                continue
-
+def _find_pip() -> Path | None:
+    """通过 importlib 查找 pip 安装的 aipyapp。"""
+    try:
+        from importlib.util import find_spec
+        spec = find_spec("aipyapp")
+        if spec and spec.origin:
+            origin = Path(spec.origin)  # .../aipyapp/__init__.py
+            if origin.name == "__init__.py" and origin.parent.name == "aipyapp":
+                return origin.parent.parent
+    except (ImportError, ValueError, AttributeError):
+        pass
     return None
 
 
-def _search_macos(exe_name: str) -> str | None:
-    """macOS: 搜索 Applications 目录。"""
-    sub_path = "Contents/Resources/app.asar.unpacked/resources/bin"
-    candidates = [
-        Path(f"/Applications/AiPyPro.app/{sub_path}/{exe_name}"),
-        Path.home() / f"Applications/AiPyPro.app/{sub_path}/{exe_name}",
-    ]
-    for c in candidates:
-        if c.exists():
-            return str(c)
-
-    # 通配搜索
-    for base in [Path("/Applications"), Path.home() / "Applications"]:
-        if not base.exists():
-            continue
-        try:
-            for p in base.rglob(f"*AiPyPro*/{sub_path}/{exe_name}"):
-                return str(p)
-        except PermissionError:
-            continue
-
-    return None
-
-
-def _search_linux(exe_name: str) -> str | None:
-    """Linux: 搜索常见安装目录。"""
-    candidates = [
-        f"/opt/AiPyPro/resources/app.asar.unpacked/resources/bin/{exe_name}",
-        f"/usr/local/bin/{exe_name}",
-        f"/usr/local/share/AiPyPro/resources/app.asar.unpacked/resources/bin/{exe_name}",
-    ]
-    for c in candidates:
-        if Path(c).exists():
-            return c
-
-    # 搜索 home 目录
-    home = Path.home()
-    for pattern in [".local/bin", "Applications", "apps"]:
-        base = home / pattern
-        if not base.exists():
-            continue
-        try:
-            for p in base.rglob(f"**/{exe_name}"):
-                if "aipy" in str(p).lower():
-                    return str(p)
-        except PermissionError:
-            continue
-
-    return None
-
-
-def _find_from_config() -> str | None:
-    """从 AiPyPro 配置文件中推断安装路径。"""
+def _find_from_aipy_config() -> Path | None:
+    """从 ~/.aipyapp 配置/日志中提取 aipypro.exe 路径，反推源码目录。"""
     config_dir = Path.home() / ".aipyapp"
-    if not config_dir.exists():
+    if not config_dir.is_dir():
         return None
 
-    # 从日志中提取路径信息
+    # 从日志中提取 aipypro.exe 路径
     log_file = config_dir / "aipyapp.log"
     if log_file.exists():
         try:
-            content = log_file.read_text(encoding="utf-8", errors="ignore")
             import re
-            match = re.search(r'([A-Za-z]:[^"\'\s]*aipypro\.exe)', content)
-            if match and Path(match.group(1)).exists():
-                return match.group(1)
+            content = log_file.read_text(encoding="utf-8", errors="ignore")
+            # 匹配 Windows 绝对路径中的 aipypro.exe
+            for m in re.finditer(r'([A-Za-z]:[^\s"\']*?aipypro\.exe)', content):
+                exe = Path(m.group(1))
+                if exe.exists():
+                    # exe 在 resources/.../bin/aipypro.exe，回到 aipyapp 父目录
+                    src = exe.parent.parent / "aipyapp"  # bin/../aipyapp
+                    if _is_aipyapp_root(src):
+                        return src
+                    # 尝试更上级
+                    for ancestor in exe.parents:
+                        if _is_aipyapp_root(ancestor):
+                            return ancestor
+        except Exception:
+            pass
+
+    # 从配置文件推断
+    toml_file = config_dir / "aipyapp.toml"
+    if toml_file.exists():
+        try:
+            import tomllib
+            cfg = tomllib.loads(toml_file.read_text(encoding="utf-8"))
+            install_path = cfg.get("install_path") or cfg.get("app_path")
+            if install_path:
+                p = Path(install_path) / _AIPYAPP_SUB
+                if _is_aipyapp_root(p):
+                    return p
         except Exception:
             pass
 
     return None
 
 
-AIPYPRO = _find_aipypro()
-TIMEOUT = int(os.environ.get("AIPYPRO_TIMEOUT", "300"))
+def _search_filesystem() -> Path | None:
+    """遍历常见安装位置搜索 AiPyPro Electron 目录。"""
+    if sys.platform == "win32":
+        return _search_windows()
+    # WSL / Linux: 通过 /mnt 访问 Windows 盘符
+    mnt = Path("/mnt")
+    if mnt.exists():
+        return _search_wsl(mnt)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Windows 搜索
+# ---------------------------------------------------------------------------
+
+def _search_windows() -> Path | None:
+    """Windows: 遍历所有盘符的常见安装目录。"""
+    import string, os as _os
+
+    for drive in string.ascii_uppercase:
+        root = Path(f"{drive}:\\")
+        if not root.exists():
+            continue
+
+        # --- 常见安装目录(按优先级) ---
+        search_roots: list[Path] = [
+            # 默认安装路径
+            root / "aipy",
+            # 标准 Windows 安装
+            root / "Program Files",
+            root / "Program Files (x86)",
+        ]
+
+        # 用户目录下的安装
+        for env_var in ("LOCALAPPDATA", "APPDATA", "USERPROFILE"):
+            val = _os.environ.get(env_var, "")
+            if val:
+                p = Path(val)
+                if p.exists() and p.drive.rstrip("\\").upper() == f"{drive}:":
+                    search_roots.append(p)
+
+        # 在每个 search_root 下查找 *AiPyPro* 或 *aipy* 目录
+        for base in search_roots:
+            if not base.exists():
+                continue
+            result = _scan_dir_for_aipyapp(base, max_depth=3)
+            if result:
+                return result
+
+        # 盘符根目录兜底：aipy/AiPyPro 或 *aipy*/
+        result = _scan_dir_for_aipyapp(root, max_depth=2)
+        if result:
+            return result
+
+    return None
+
+
+def _scan_dir_for_aipyapp(base: Path, max_depth: int) -> Path | None:
+    """在 base 下扫描 AiPyPro 安装目录，找到则返回 aipyapp 父目录。"""
+    if max_depth <= 0:
+        return None
+
+    # 直接检查 base 自身
+    # base / AiPyPro / resources/app.asar.unpacked/resources/aipyapp
+    for top_name in ("AiPyPro", "AiPy", "aipypro", "aipy-app"):
+        candidate = base / top_name / _AIPYAPP_SUB
+        if _is_aipyapp_root(candidate):
+            return candidate
+
+    # 通配：base 下含 "aipy" 的目录
+    try:
+        for entry in base.iterdir():
+            if not entry.is_dir():
+                continue
+            name_lower = entry.name.lower()
+            if "aipy" in name_lower or "ai-py" in name_lower:
+                # 直接匹配
+                candidate = entry / _AIPYAPP_SUB
+                if _is_aipyapp_root(candidate):
+                    return candidate
+                # 再深一层: entry / AiPyPro / sub
+                candidate2 = entry / "AiPyPro" / _AIPYAPP_SUB
+                if _is_aipyapp_root(candidate2):
+                    return candidate2
+                # 子目录通配
+                if max_depth > 1:
+                    try:
+                        for sub_entry in entry.iterdir():
+                            if sub_entry.is_dir() and "aipy" in sub_entry.name.lower():
+                                c = sub_entry / _AIPYAPP_SUB
+                                if _is_aipyapp_root(c):
+                                    return c
+                    except PermissionError:
+                        continue
+    except PermissionError:
+        pass
+
+    # 递归进入子目录 (深度有限)
+    if max_depth > 1:
+        try:
+            for entry in base.iterdir():
+                if not entry.is_dir() or entry.name.startswith("."):
+                    continue
+                if entry.name.lower() in ("windows", "windowsapps", "windows nt", "system volume information"):
+                    continue
+                if "aipy" not in entry.name.lower():
+                    continue
+                result = _scan_dir_for_aipyapp(entry, max_depth - 1)
+                if result:
+                    return result
+        except PermissionError:
+            pass
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# WSL 搜索
+# ---------------------------------------------------------------------------
+
+def _search_wsl(mnt: Path) -> Path | None:
+    """WSL: 遍历 /mnt/{c..h} 下的常见安装目录。"""
+    import os as _os
+
+    for d in "cdefgh":
+        drive_root = mnt / d
+        if not drive_root.exists():
+            continue
+
+        # 常见安装目录
+        search_roots: list[Path] = [
+            drive_root / "aipy",
+            drive_root / "Program Files",
+            drive_root / "Program Files (x86)",
+        ]
+
+        # Windows 用户目录映射到 WSL
+        for wenv in ("LOCALAPPDATA", "APPDATA", "USERPROFILE"):
+            val = _os.environ.get(wenv, "")
+            if val:
+                # Windows 路径 → WSL 路径
+                wsl_path = _win_to_wsl(val, mnt)
+                if wsl_path and wsl_path.exists():
+                    search_roots.append(wsl_path)
+
+        for base in search_roots:
+            if not base.exists():
+                continue
+            result = _scan_dir_for_aipyapp(base, max_depth=3)
+            if result:
+                return result
+
+        # 兜底扫描
+        result = _scan_dir_for_aipyapp(drive_root, max_depth=2)
+        if result:
+            return result
+
+    return None
+
+
+def _win_to_wsl(win_path: str, mnt: Path) -> Path | None:
+    """将 Windows 绝对路径转为 WSL /mnt 路径。"""
+    try:
+        p = Path(win_path)
+        parts = p.parts
+        if len(parts) >= 2 and len(parts[0]) == 2 and parts[0][1] == ":":
+            drive_letter = parts[0][0].lower()
+            return mnt / drive_letter / Path(*parts[1:])
+    except Exception:
+        pass
+    return None
+
+AIPYAPP_PATH = _resolve_aipyapp_path()
+
+# 将 aipyapp 添加到 sys.path
+_aipyapp_parent = str(AIPYAPP_PATH)
+if _aipyapp_parent not in sys.path:
+    sys.path.insert(0, _aipyapp_parent)
+
+# ---------------------------------------------------------------------------
+# 延迟导入 aipyapp (在 _init_aipy 中调用，确保路径就绪)
+# ---------------------------------------------------------------------------
+
+_aipy_imports: dict[str, Any] = {}
+_init_lock = threading.Lock()
+_initialized = False
+
+def _init_aipy():
+    """初始化 AI-PY 内核 (TaskManager, DisplayManager 等)。
+
+    线程安全，仅初始化一次。
+    """
+    global _initialized, _aipy_imports
+
+    if _initialized:
+        return
+
+    with _init_lock:
+        if _initialized:
+            return
+
+        # ---- 临时抑制 loguru，避免污染 stdio ----
+        try:
+            from loguru import logger
+            logger.remove()
+        except ImportError:
+            pass
+
+        # ---- 导入 aipyapp 核心模块 ----
+        from aipyapp.aipy.config import CONFIG_DIR, ConfigManager
+        from aipyapp.aipy.taskmgr import TaskManager
+        from aipyapp.aipy.unified_agent import UnifiedAgent, TaskSwitchRequest
+        from aipyapp.display import DisplayManager
+        from aipyapp.interface import Event
+
+        # ---- 配置 ----
+        config_dir = os.environ.get("AIPYAPP_CONFIG_DIR", str(CONFIG_DIR))
+        config_manager = ConfigManager(config_dir)
+
+        settings = _build_settings(config_manager)
+
+        # ---- Display Manager (MCP 定制插件) ----
+        display_config = {"style": "mcp", "quiet": True}
+        display_manager = DisplayManager(display_config, record=False, quiet=True)
+        display_manager.register_plugin(MCPDisplayPlugin, name="mcp")
+
+        # ---- TaskManager ----
+        tm = TaskManager(settings, display_manager=display_manager)
+
+        # 特性开关: 启用 subtask / exec_code，禁用不需要的功能
+        role = tm.role_manager.current_role
+        role.features["subtask"] = False
+        role.features["survey"] = False
+        role.features["aipy_call"] = True
+        role.features["openai_call"] = False
+        role.features["exec_code"] = True
+
+        _aipy_imports = {
+            "config_manager": config_manager,
+            "settings": settings,
+            "display_manager": display_manager,
+            "tm": tm,
+            "UnifiedAgent": UnifiedAgent,
+            "TaskSwitchRequest": TaskSwitchRequest,
+            "Event": Event,
+        }
+
+        _initialized = True
+
+
+def _build_settings(config_manager) -> dict:
+    """构建 AI-PY settings 字典。"""
+    conf = config_manager.config
+    from aipyapp.aipy.config import CONFIG_DIR
+    from aipyapp.i18n import set_lang
+
+    settings = dict(conf)
+    settings["workdir"] = str(CONFIG_DIR / "work")
+    settings["gui"] = False
+    settings["auto_install"] = True
+    settings["auto_getenv"] = True
+    settings["lang"] = os.environ.get("AIPYAPP_LANG", "zh")
+    set_lang(settings["lang"])
+    settings["role"] = "aipy"
+    settings["max_rounds"] = int(os.environ.get("AIPYAPP_MAX_ROUNDS", "32"))
+    settings["timeout"] = 0
+    settings["share_result"] = False
+    settings["diagnose"] = {"enabled": False}
+    settings["skills"] = {"enabled": True}
+    settings["config_manager"] = config_manager
+
+    # LLM Provider: 优先环境变量, 其次 AiPyPro 配置
+    provider_env = os.environ.get("AIPYAPP_PROVIDER", "")
+    if provider_env:
+        try:
+            provider = json.loads(provider_env)
+        except json.JSONDecodeError:
+            provider = {"name": "trustoken", "type": "trust", "api_key": provider_env}
+    else:
+        provider = settings.get("provider",
+            {"name": "trustoken", "type": "trust", "api_key": "xyz"})
+
+    settings["llm"] = {
+        provider.get("name", "trustoken"): {
+            **provider,
+            "enable": True,
+            "default": True,
+        }
+    }
+
+    # MCP (不使用 sys MCP)
+    settings["mcp"] = {"sys_mcp_enabled": False}
+
+    # 环境变量注入
+    envs = settings.get("environ", {})
+    for name, value in envs.items():
+        os.environ[name] = str(value)
+
+    return settings
+
+
+# ---------------------------------------------------------------------------
+# MCP 定制 Display Plugin — 收集 AI-PY 输出文本
+# ---------------------------------------------------------------------------
+
+class MCPDisplayPlugin:
+    """MCP 专用的 Display Plugin。
+
+    不输出到终端，而是将 AI 回复文本收集到缓冲区，供 MCP 工具返回。
+    与 StdioDisplayPlugin 的 JSON 事件流不同，这里只提取纯文本内容。
+    """
+    name = "mcp"
+    version = "1.0.0"
+    description = "MCP Display Plugin — collects AI output for MCP tools"
+    author = "AiPy MCP Team"
+
+    # --- 类级存储 (thread-local 不够，因为跨线程访问) ---
+    _storage: dict[str, list[str]] = {}  # task_id -> [text chunks]
+    _lock = threading.Lock()
+
+    def __init__(self, console=None, quiet: bool = False):
+        self.console = console
+        self.quiet = quiet
+        self._current_task_id: str | None = None
+
+    @staticmethod
+    def new_collector(task_id: str):
+        """为指定 task_id 创建新的文本收集器。"""
+        with MCPDisplayPlugin._lock:
+            MCPDisplayPlugin._storage[task_id] = []
+
+    @staticmethod
+    def get_text(task_id: str) -> str:
+        """获取并清除指定 task_id 的收集文本。"""
+        with MCPDisplayPlugin._lock:
+            chunks = MCPDisplayPlugin._storage.pop(task_id, [])
+        return "\n".join(chunks)
+
+    # --- DisplayPlugin 接口 ---
+
+    def save(self, path: str, clear: bool = False, code_format: str = ""):
+        pass
+
+    def print(self, message: str, style: str = ""):
+        pass
+
+    def input(self, prompt: str) -> str:
+        return ""
+
+    def confirm(self, prompt, default="n", auto=None):
+        return True
+
+    # --- event handlers ---
+
+    def _emit_text(self, text: str):
+        if not text or not text.strip():
+            return
+        # 使用全局 task_id fallback
+        tid = self._current_task_id or "__global__"
+        with MCPDisplayPlugin._lock:
+            if tid not in MCPDisplayPlugin._storage:
+                MCPDisplayPlugin._storage[tid] = []
+            MCPDisplayPlugin._storage[tid].append(text.strip())
+
+    def on_exception(self, event):
+        msg = event.data.get("msg", "")
+        exc = event.data.get("exception", "")
+        self._emit_text(f"[ERROR] {msg}\n{exc}")
+
+    def on_request_started(self, event):
+        pass
+
+    def on_stream_started(self, event):
+        pass
+
+    def on_stream(self, event):
+        # 流式输出暂不收集 (量大且重复)
+        pass
+
+    def on_parse_reply_completed(self, event):
+        data = event.data
+        response = data.get("response", {}) or {}
+        message = response.get("message", {}) or {}
+        msg = message.get("message", {}) or {}
+        content = msg.get("content", "")
+        if content and isinstance(content, str) and content.strip():
+            self._emit_text(content.strip())
+
+    def on_function_call_started(self, event):
+        pass
+
+    def on_function_call_completed(self, event):
+        pass
+
+    def on_tool_call_started(self, event):
+        pass
+
+    def on_tool_call_completed(self, event):
+        pass
+
+    def on_step_completed(self, event):
+        data = event.data
+        summary = data.get("summary", {}) or {}
+        s = summary.get("summary", "")
+        if s:
+            self._emit_text(str(s))
+
+    def on_task_start(self, event):
+        pass
+
+    def on_task_end(self, event):
+        pass
+
+    def on_response_complete(self, event):
+        pass
+
+    def on_call_function(self, event):
+        pass
+
+    def on_exec_result(self, event):
+        pass
+
+    def on_query_start(self, event):
+        pass
+
+    def on_round_start(self, event):
+        pass
+
+    def on_round_end(self, event):
+        pass
+
+    def on_parse_reply(self, event):
+        pass
+
+    def on_exec(self, event):
+        pass
+
+    def on_mcp_result(self, event):
+        pass
+
+    def on_mcp_call(self, event):
+        pass
+
+    def on_upload_result(self, event):
+        pass
+
+    def on_runtime_message(self, event):
+        msg = event.data.get("message", "")
+        if msg:
+            self._emit_text(str(msg))
+
+    def on_runtime_input(self, event):
+        pass
+
+    def on_show_image(self, event):
+        pass
+
+    def on_stream_end(self, event):
+        pass
+
+    def on_stream_completed(self, event):
+        pass
+
+    @classmethod
+    def get_type(cls):
+        from aipyapp.plugin import PluginType
+        return PluginType.DISPLAY
+
+    def init(self):
+        pass
+
+    def get_handlers(self):
+        return {
+            "exception": self.on_exception,
+            "request_started": self.on_request_started,
+            "stream_started": self.on_stream_started,
+            "stream": self.on_stream,
+            "stream_completed": self.on_stream_completed,
+            "parse_reply_completed": self.on_parse_reply_completed,
+            "function_call_started": self.on_function_call_started,
+            "function_call_completed": self.on_function_call_completed,
+            "tool_call_started": self.on_tool_call_started,
+            "tool_call_completed": self.on_tool_call_completed,
+            "step_completed": self.on_step_completed,
+            "task_start": self.on_task_start,
+            "task_end": self.on_task_end,
+            "response_complete": self.on_response_complete,
+            "call_function": self.on_call_function,
+            "exec_result": self.on_exec_result,
+            "query_start": self.on_query_start,
+            "round_start": self.on_round_start,
+            "round_end": self.on_round_end,
+            "parse_reply": self.on_parse_reply,
+            "exec": self.on_exec,
+            "mcp_result": self.on_mcp_result,
+            "mcp_call": self.on_mcp_call,
+            "upload_result": self.on_upload_result,
+            "runtime_message": self.on_runtime_message,
+            "runtime_input": self.on_runtime_input,
+            "show_image": self.on_show_image,
+        }
+
+
+# ---------------------------------------------------------------------------
+# 核心执行函数
+# ---------------------------------------------------------------------------
+
+TIMEOUT = int(os.environ.get("AIPYAPP_TIMEOUT", "600"))
+
+
+def _run_task(instruction: str, mode: str, cwd: str) -> str:
+    """在独立线程中执行 AI-PY 任务 (同步阻塞)。
+
+    由 asyncio.to_thread() 调用, 不阻塞 MCP 事件循环。
+    """
+    _init_aipy()
+
+    tm = _aipy_imports["tm"]
+    UnifiedAgent = _aipy_imports["UnifiedAgent"]
+    TaskSwitchRequest = _aipy_imports["TaskSwitchRequest"]
+
+    task_id = f"mcp_{id(instruction)}_{hash(instruction) & 0xFFFFFFFF:08x}"
+    MCPDisplayPlugin.new_collector(task_id)
+
+    # 调整工作目录
+    target_cwd = Path(cwd).expanduser().resolve() if cwd else tm.cwd
+    if target_cwd.exists():
+        os.chdir(str(target_cwd))
+
+    result_parts: list[str] = []
+
+    try:
+        if mode in ("auto", "qa"):
+            # ---- UnifiedAgent: 自动路由 QA / Task ----
+            agent = UnifiedAgent(
+                tm.settings,
+                display_manager=_aipy_imports["display_manager"],
+                enable_task=(mode != "qa"),
+                task_manager=tm,
+            )
+
+            # 收集流式输出
+            stream_chunks: list[str] = []
+
+            def _on_stream(event):
+                lines = getattr(event, "lines", None) or []
+                if lines:
+                    stream_chunks.append("\n".join(lines))
+
+            def _on_parse_reply(event):
+                data = event.data
+                response = data.get("response", {}) or {}
+                msg = response.get("message", {}) or {}
+                content = (msg.get("message", {}) or {}).get("content", "")
+                if content and isinstance(content, str):
+                    nonlocal stream_chunks
+                    stream_chunks = []  # 清空流式缓存，用最终结果
+                    result_parts.append(content.strip())
+
+            agent.on_event("stream", _on_stream)
+            agent.on_event("parse_reply_completed", _on_parse_reply)
+
+            result = agent.run(instruction)
+
+            if isinstance(result, TaskSwitchRequest):
+                # UnifiedAgent 决定启动任务模式
+                result_parts.append(_run_full_task(result.task, result.instruction))
+            elif not result_parts and stream_chunks:
+                result_parts.append("\n".join(stream_chunks))
+            elif not result_parts and hasattr(result, "content") and result.content:
+                result_parts.append(str(result.content))
+
+        else:
+            # ---- task 模式: 直接创建 Task ----
+            task = tm.new_task()
+            result_parts.append(_run_full_task(task, instruction))
+
+    except Exception as e:
+        import traceback
+        result_parts.append(f"[ERROR] 任务执行异常:\n{traceback.format_exc()}")
+
+    # 合并结果
+    display_text = MCPDisplayPlugin.get_text(task_id)
+    if display_text:
+        result_parts.append(display_text)
+
+    final = "\n\n".join(filter(None, result_parts)).strip()
+    return final or "任务执行完成（无输出）"
+
+
+def _run_full_task(task, instruction: str) -> str:
+    """执行完整 Task 循环并收集结果。"""
+    from aipyapp.aipy.chat import ChatMessage
+
+    task_id = task.task_id
+    collected: list[str] = []
+
+    # 注册事件监听，从 task 的 event_bus 获取最终回复
+    def _on_parse_reply(event):
+        data = event.data
+        response = data.get("response", {}) or {}
+        msg = response.get("message", {}) or {}
+        inner = msg.get("message", {}) or {}
+        content = inner.get("content", "")
+        if content and isinstance(content, str) and content.strip():
+            collected.append(content.strip())
+
+    def _on_step_completed(event):
+        data = event.data
+        summary = data.get("summary", {}) or {}
+        s = summary.get("summary", "")
+        if s:
+            collected.append(str(s))
+
+    task.event_bus.on_event("parse_reply_completed", _on_parse_reply)
+    task.event_bus.on_event("step_completed", _on_step_completed)
+
+    try:
+        task.run(instruction)
+        task.done()
+    except (EOFError, KeyboardInterrupt):
+        pass
+    except Exception:
+        import traceback
+        collected.append(f"[ERROR] {traceback.format_exc()}")
+
+    return "\n".join(collected)
+
+
+def _run_python(code: str, cwd: str) -> str:
+    """通过 AI-PY Python Runtime 直接执行代码。"""
+    _init_aipy()
+
+    import io
+    from contextlib import redirect_stdout, redirect_stderr
+
+    target_cwd = Path(cwd).expanduser().resolve() if cwd else Path.cwd()
+    if target_cwd.exists():
+        os.chdir(str(target_cwd))
+
+    buf_out = io.StringIO()
+    buf_err = io.StringIO()
+
+    try:
+        # 编译代码
+        compiled = compile(code, "<aipy_python>", "exec")
+
+        with redirect_stdout(buf_out), redirect_stderr(buf_err):
+            namespace: dict[str, Any] = {}
+            exec(compiled, namespace)
+
+        out = buf_out.getvalue().strip()
+        err = buf_err.getvalue().strip()
+
+        if err:
+            return f"[stderr]\n{err}\n\n[stdout]\n{out}" if out else f"[stderr]\n{err}"
+        return out or "代码执行完成（无输出）"
+
+    except Exception:
+        import traceback
+        tb = traceback.format_exc()
+        out = buf_out.getvalue().strip()
+        err = buf_err.getvalue().strip()
+        parts = [tb]
+        if out:
+            parts.append(f"[stdout]\n{out}")
+        if err:
+            parts.append(f"[stderr]\n{err}")
+        return "\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +825,7 @@ TOOLS = [
         description=(
             "通过 AiPyPro 执行 AI 驱动的任务。\n"
             "\n"
-            "AiPyPro 是一个遵循「No Agents, Code is Agent」理念的 AI Agent。"
+            "AiPyPro 遵循「No Agents, Code is Agent」理念。"
             "它会将自然语言指令自主转化为 Python 代码并在本地执行，"
             "完成 Task → Plan → Code → Execute → Feedback 的完整闭环。\n"
             "\n"
@@ -296,69 +897,27 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     if name == "aipy_run":
         instruction = arguments["instruction"]
         mode = arguments.get("mode", "auto")
-        cmd = [AIPYPRO, "run", "-m", mode, instruction]
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=cwd,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            result = await asyncio.wait_for(
+                asyncio.to_thread(_run_task, instruction, mode, cwd),
+                timeout=TIMEOUT,
             )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=TIMEOUT
-            )
-
-            out_text = stdout.decode("utf-8", errors="replace").strip()
-            err_text = stderr.decode("utf-8", errors="replace").strip()
-
-            if proc.returncode == 0:
-                result = out_text or "任务执行完成（无输出）"
-            else:
-                result = (
-                    f"⚠️ 任务执行失败 (exit code: {proc.returncode})\n\n"
-                    f"--- STDOUT ---\n{out_text or '(无)'}\n\n"
-                    f"--- STDERR ---\n{err_text or '(无)'}"
-                )
-
         except asyncio.TimeoutError:
-            result = f"⏱️ 任务超时（>{TIMEOUT}秒）: {instruction[:100]}..."
+            result = f"⏱️ 任务超时 (>{TIMEOUT}秒): {instruction[:100]}..."
 
         return [TextContent(type="text", text=result)]
 
     elif name == "aipy_python":
         code = arguments["code"]
-        cmd = [AIPYPRO, "python"]
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=cwd,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=code.encode("utf-8")),
+            result = await asyncio.wait_for(
+                asyncio.to_thread(_run_python, code, cwd),
                 timeout=TIMEOUT,
             )
-
-            out_text = stdout.decode("utf-8", errors="replace").strip()
-            err_text = stderr.decode("utf-8", errors="replace").strip()
-
-            if proc.returncode == 0:
-                result = out_text or "代码执行完成（无输出）"
-            else:
-                result = (
-                    f"⚠️ 执行失败 (exit code: {proc.returncode})\n\n"
-                    f"--- STDOUT ---\n{out_text or '(无)'}\n\n"
-                    f"--- STDERR ---\n{err_text or '(无)'}"
-                )
-
         except asyncio.TimeoutError:
-            result = f"⏱️ 执行超时（>{TIMEOUT}秒）"
+            result = f"⏱️ 执行超时 (>{TIMEOUT}秒)"
 
         return [TextContent(type="text", text=result)]
 
@@ -372,7 +931,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
 def main():
     """MCP Server 入口 — stdio 传输模式。"""
-    print(f"[aipy-mcp] 启动成功，aipypro: {AIPYPRO}", file=sys.stderr)
+    print(f"[aipy-mcp] aipyapp 源码: {AIPYAPP_PATH}", file=sys.stderr)
     print(f"[aipy-mcp] 超时设置: {TIMEOUT}s", file=sys.stderr)
 
     async def _run():

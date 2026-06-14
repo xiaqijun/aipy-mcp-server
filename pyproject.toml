@@ -1,11 +1,24 @@
 [project]
 name = "aipy-mcp-server"
-version = "0.1.0"
-description = "MCP Server wrapping AiPyPro — AI-powered Python task execution (No Agents, Code is Agent)"
+version = "0.2.0"
+description = "MCP Server directly integrating AiPyPro kernel — AI-powered Python task execution (No Agents, Code is Agent)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "mcp[cli]>=1.0.0",
+
+    # --- aipyapp 核心依赖 (从源码直接 import 所需) ---
+    "pydantic>=2.12.5",
+    "loguru>=0.7.3",
+    "dynaconf>=3.2.10",
+    "openai>=1.68.2",
+    "jinja2>=3.1.6",
+    "pyyaml>=6.0.2",
+    "requests>=2.32.3",
+    "httpx>=0.28.1",
+    "uuid-utils>=0.11.1",
+    "beautifulsoup4>=4.13.3",
+    "tomli-w>=1.2.0",
 ]
 
 [project.scripts]
