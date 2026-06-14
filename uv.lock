@@ -15,21 +15,6 @@ name = "aipy-mcp-server"
 version = "0.2.0"
 source = { editable = "." }
 dependencies = [
-    { name = "aipyapp" },
-    { name = "mcp", extra = ["cli"] },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aipyapp", editable = "/mnt/e/aipy/AiPyPro/resources/app.asar.unpacked/resources/aipyapp" },
-    { name = "mcp", extras = ["cli"], specifier = ">=1.0.0" },
-]
-
-[[package]]
-name = "aipyapp"
-version = "0.5.0"
-source = { editable = "/mnt/e/aipy/AiPyPro/resources/app.asar.unpacked/resources/aipyapp" }
-dependencies = [
     { name = "anthropic" },
     { name = "beautifulsoup4" },
     { name = "charset-normalizer" },
@@ -42,7 +27,6 @@ dependencies = [
     { name = "openai" },
     { name = "openpyxl" },
     { name = "pandas" },
-    { name = "pip" },
     { name = "prompt-toolkit" },
     { name = "promptabs" },
     { name = "pydantic" },
@@ -68,11 +52,10 @@ requires-dist = [
     { name = "httpx", extras = ["socks"], specifier = ">=0.28.1" },
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "loguru", specifier = ">=0.7.3" },
-    { name = "mcp", extras = ["cli"], specifier = ">=1.21.0" },
+    { name = "mcp", extras = ["cli"], specifier = ">=1.0.0" },
     { name = "openai", specifier = ">=1.68.2" },
     { name = "openpyxl", specifier = ">=3.1.5" },
     { name = "pandas", specifier = ">=2.2.3" },
-    { name = "pip", specifier = ">=26.1.1" },
     { name = "prompt-toolkit", specifier = ">=3.0.51" },
     { name = "promptabs", specifier = ">=0.3.1" },
     { name = "pydantic", specifier = ">=2.12.5" },
@@ -1364,15 +1347,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pip"
-version = "26.1.2"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/01/91/47e7d486260f618783899587af63ccf7980fb60245c3e63dd4571c6b57ad/pip-26.1.2.tar.gz", hash = "sha256:f49cd134c61cf2fd75e0ce2676db03e4054504a5a4986d00f8299ae632dc4605", size = 1840799, upload-time = "2026-05-31T17:33:58.56Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/5d/95/6b5cb3461ea5673ba0995989746db58eb18b91b54dbf331e72f569540946/pip-26.1.2-py3-none-any.whl", hash = "sha256:382ff9f685ee3bc25864f820aa50505825f10f5458ffff07e30a6d96e5715cab", size = 1813144, upload-time = "2026-05-31T17:33:56.772Z" },
-]
-
-[[package]]
 name = "prompt-toolkit"
 version = "3.0.52"
 source = { registry = "https://pypi.org/simple" }
@@ -2154,8 +2128,8 @@ name = "uvicorn"
 version = "0.49.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click" },
-    { name = "h11" },
+    { name = "click", marker = "sys_platform != 'emscripten'" },
+    { name = "h11", marker = "sys_platform != 'emscripten'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c4/1f/fa18009dea8469069cca78a4e877a008ab78f08b064bfc9ab891579077ff/uvicorn-0.49.0.tar.gz", hash = "sha256:ebf4271aa580d9de97f93192d4595176df6e91f9aae919ca73e4fc07df1e66a3", size = 91284, upload-time = "2026-06-03T22:01:30.448Z" }
 wheels = [

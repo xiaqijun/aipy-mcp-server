@@ -6,7 +6,31 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "mcp[cli]>=1.0.0",
-    "aipyapp",
+    # --- aipyapp 全部传递依赖 (与 aipyapp pyproject.toml 保持同步) ---
+    "pydantic>=2.12.5",
+    "anthropic>=0.49.0",
+    "beautifulsoup4>=4.13.3",
+    "dynaconf>=3.2.10",
+    "openai>=1.68.2",
+    "pandas>=2.2.3",
+    "prompt-toolkit>=3.0.51",
+    "pygments>=2.19.2",
+    "requests>=2.32.3",
+    "rich>=13.9.4",
+    "seaborn>=0.13.2",
+    "tomli-w>=1.2.0",
+    "qrcode>=8.1",
+    "loguru>=0.7.3",
+    "questionary>=2.1.0",
+    "openpyxl>=3.1.5",
+    "pyyaml>=6.0.2",
+    "jinja2>=3.1.6",
+    "charset-normalizer>=3.4.2",
+    "fastapi>=0.116.1",
+    "promptabs>=0.3.1",
+    "httpx>=0.28.1",
+    "httpx[socks]>=0.28.1",
+    "uuid-utils>=0.11.1",
 ]
 
 [project.scripts]
@@ -22,6 +46,3 @@ include = ["server.py"]
 
 [tool.uv]
 package = true
-
-[tool.uv.sources]
-aipyapp = { path = "/mnt/e/aipy/AiPyPro/resources/app.asar.unpacked/resources/aipyapp", editable = true }

@@ -31,36 +31,21 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 # ---------------------------------------------------------------------------
-# 源码路径解析 — 优先 pip install，fallback 自动检测
+# 源码路径解析 — 自动检测 aipyapp，加入 sys.path
 # ---------------------------------------------------------------------------
 
-# Electron app 内 aipyapp 源码的相对路径
 _AIPYAPP_SUB = Path("resources/app.asar.unpacked/resources/aipyapp")
-
-# 在模块级别尝试导入 aipyapp（uv sync 已通过 [tool.uv.sources] 安装时）
-_AIPYAPP_PATH: Path | None = None
-try:
-    import aipyapp as _test_aipyapp
-    _AIPYAPP_PATH = Path(_test_aipyapp.__file__).parent.parent
-    print(f"[aipy-mcp] 使用 pip 安装的 aipyapp: {_AIPYAPP_PATH}", file=sys.stderr)
-except ImportError:
-    pass
 
 
 def _resolve_aipyapp_path() -> Path:
     """解析 aipyapp 源码目录（返回包含 aipyapp/__init__.py 的父目录）。
 
     检测顺序 (任一命中即返回):
-        1. 已通过 pip/uv 安装的 aipyapp 包 (_AIPYAPP_PATH)
-        2. 环境变量 AIPYAPP_PATH
-        3. ~/.aipyapp 日志/配置中的路径线索
-        4. Windows / WSL 常见安装位置遍历
+        1. 环境变量 AIPYAPP_PATH
+        2. ~/.aipyapp 日志/配置中的路径线索
+        3. Windows / WSL 常见安装位置遍历
     """
-    # 1. pip 安装 (模块级别已导入)
-    if _AIPYAPP_PATH is not None:
-        return _AIPYAPP_PATH
-
-    # 2. 环境变量
+    # 1. 环境变量
     env = os.environ.get("AIPYAPP_PATH", "")
     if env:
         p = Path(env).expanduser().resolve()
@@ -69,20 +54,19 @@ def _resolve_aipyapp_path() -> Path:
         if (p / "__init__.py").exists() and p.name == "aipyapp":
             return p.parent
 
-    # 3. 配置文件/日志线索
+    # 2. 配置文件/日志线索
     found = _find_from_aipy_config()
     if found:
         return found
 
-    # 4. 系统搜索
+    # 3. 系统搜索
     found = _search_filesystem()
     if found:
         return found
 
     raise FileNotFoundError(
         "找不到 aipyapp 源码目录。\n"
-        "方式一: cd aipy-mcp-server && uv sync (自动安装)\n"
-        "方式二: 设置环境变量 AIPYAPP_PATH 指向 aipyapp 源码目录\n"
+        "请设置环境变量 AIPYAPP_PATH 指向 aipyapp 源码目录。\n"
         "示例: AIPYAPP_PATH=E:/aipy/AiPyPro/resources/app.asar.unpacked/resources/aipyapp\n"
         "下载: https://www.aipy.app/"
     )
