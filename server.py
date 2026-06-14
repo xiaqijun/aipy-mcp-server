@@ -393,26 +393,27 @@ def _build_settings(config_manager):
     conf.skills = {"enabled": True}
     conf.config_manager = config_manager
 
-    # LLM Provider: 直接使用 AiPyPro 已有配置, 环境变量可覆盖
+    # LLM Provider: 直接从 AiPyPro 的 config/llm.json 读取 (与环境变量合并)
     provider_env = os.environ.get("AIPYAPP_PROVIDER", "")
     if provider_env:
         try:
             provider = json.loads(provider_env)
         except json.JSONDecodeError:
             provider = {"name": "trustoken", "type": "trust", "api_key": provider_env}
-        conf.llm = {
-            provider.get("name", "trustoken"): {
-                **provider,
-                "enable": True,
-                "default": True,
-            }
-        }
-    elif not conf.get("llm"):
-        raise RuntimeError(
-            "未找到 AiPyPro LLM 配置。\n"
-            "请在 AiPyPro 中先配置 LLM Provider，或设置 AIPYAPP_PROVIDER 环境变量。\n"
-            "示例: AIPYAPP_PROVIDER='{\"name\":\"deepseek\",\"type\":\"openai\",\"api_key\":\"sk-xxx\",\"base_url\":\"https://api.deepseek.com/v1\",\"model\":\"deepseek-chat\"}'"
-        )
+        conf.llm = {provider.get("name", "trustoken"): {**provider, "enable": True, "default": True}}
+    else:
+        # 从 AiPyPro 的 config/llm.json + aipyapp.toml 读取
+        from aipyapp.config.llm import LLMConfig
+        llm_config = LLMConfig(Path(CONFIG_DIR) / "config")
+        if llm_config.config:
+            conf.llm = llm_config.config
+        elif conf.get("llm"):
+            pass  # 使用 aipyapp.toml 中的 llm 配置
+        else:
+            raise RuntimeError(
+                "未找到 AiPyPro LLM 配置。\n"
+                "请在 AiPyPro 中先配置 LLM Provider，或设置 AIPYAPP_PROVIDER 环境变量。"
+            )
 
     # MCP (不使用 sys MCP)
     conf.mcp = {"sys_mcp_enabled": False}
