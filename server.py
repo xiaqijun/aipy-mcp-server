@@ -31,23 +31,36 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 # ---------------------------------------------------------------------------
-# 源码路径解析
+# 源码路径解析 — 优先 pip install，fallback 自动检测
 # ---------------------------------------------------------------------------
 
 # Electron app 内 aipyapp 源码的相对路径
 _AIPYAPP_SUB = Path("resources/app.asar.unpacked/resources/aipyapp")
+
+# 在模块级别尝试导入 aipyapp（uv sync 已通过 [tool.uv.sources] 安装时）
+_AIPYAPP_PATH: Path | None = None
+try:
+    import aipyapp as _test_aipyapp
+    _AIPYAPP_PATH = Path(_test_aipyapp.__file__).parent.parent
+    print(f"[aipy-mcp] 使用 pip 安装的 aipyapp: {_AIPYAPP_PATH}", file=sys.stderr)
+except ImportError:
+    pass
 
 
 def _resolve_aipyapp_path() -> Path:
     """解析 aipyapp 源码目录（返回包含 aipyapp/__init__.py 的父目录）。
 
     检测顺序 (任一命中即返回):
-        1. 环境变量 AIPYAPP_PATH
-        2. pip 安装的 aipyapp 包 (importlib)
+        1. 已通过 pip/uv 安装的 aipyapp 包 (_AIPYAPP_PATH)
+        2. 环境变量 AIPYAPP_PATH
         3. ~/.aipyapp 日志/配置中的路径线索
         4. Windows / WSL 常见安装位置遍历
     """
-    # 1. 环境变量
+    # 1. pip 安装 (模块级别已导入)
+    if _AIPYAPP_PATH is not None:
+        return _AIPYAPP_PATH
+
+    # 2. 环境变量
     env = os.environ.get("AIPYAPP_PATH", "")
     if env:
         p = Path(env).expanduser().resolve()
@@ -55,11 +68,6 @@ def _resolve_aipyapp_path() -> Path:
             return p
         if (p / "__init__.py").exists() and p.name == "aipyapp":
             return p.parent
-
-    # 2. pip 安装
-    found = _find_pip()
-    if found:
-        return found
 
     # 3. 配置文件/日志线索
     found = _find_from_aipy_config()
@@ -73,7 +81,8 @@ def _resolve_aipyapp_path() -> Path:
 
     raise FileNotFoundError(
         "找不到 aipyapp 源码目录。\n"
-        "请设置环境变量 AIPYAPP_PATH 指向 aipyapp 源码目录，或安装 AiPyPro。\n"
+        "方式一: cd aipy-mcp-server && uv sync (自动安装)\n"
+        "方式二: 设置环境变量 AIPYAPP_PATH 指向 aipyapp 源码目录\n"
         "示例: AIPYAPP_PATH=E:/aipy/AiPyPro/resources/app.asar.unpacked/resources/aipyapp\n"
         "下载: https://www.aipy.app/"
     )
@@ -82,20 +91,6 @@ def _resolve_aipyapp_path() -> Path:
 def _is_aipyapp_root(p: Path) -> bool:
     """检查路径是否包含 aipyapp/__init__.py。"""
     return (p / "aipyapp" / "__init__.py").exists()
-
-
-def _find_pip() -> Path | None:
-    """通过 importlib 查找 pip 安装的 aipyapp。"""
-    try:
-        from importlib.util import find_spec
-        spec = find_spec("aipyapp")
-        if spec and spec.origin:
-            origin = Path(spec.origin)  # .../aipyapp/__init__.py
-            if origin.name == "__init__.py" and origin.parent.name == "aipyapp":
-                return origin.parent.parent
-    except (ImportError, ValueError, AttributeError):
-        pass
-    return None
 
 
 def _find_from_aipy_config() -> Path | None:
@@ -392,55 +387,58 @@ def _init_aipy():
         _initialized = True
 
 
-def _build_settings(config_manager) -> dict:
-    """构建 AI-PY settings 字典。"""
+def _build_settings(config_manager):
+    """构建 AI-PY settings（在 Dynaconf 对象上直接设属性，保持属性访问兼容）。"""
     conf = config_manager.config
     from aipyapp.aipy.config import CONFIG_DIR
     from aipyapp.i18n import set_lang
 
-    settings = dict(conf)
-    settings["workdir"] = str(CONFIG_DIR / "work")
-    settings["gui"] = False
-    settings["auto_install"] = True
-    settings["auto_getenv"] = True
-    settings["lang"] = os.environ.get("AIPYAPP_LANG", "zh")
-    set_lang(settings["lang"])
-    settings["role"] = "aipy"
-    settings["max_rounds"] = int(os.environ.get("AIPYAPP_MAX_ROUNDS", "32"))
-    settings["timeout"] = 0
-    settings["share_result"] = False
-    settings["diagnose"] = {"enabled": False}
-    settings["skills"] = {"enabled": True}
-    settings["config_manager"] = config_manager
+    # 在原始 Dynaconf 对象上设置，而非转换为 dict
+    conf.workdir = str(CONFIG_DIR / "work")
+    conf.gui = False
+    conf.auto_install = True
+    conf.auto_getenv = True
+    lang = os.environ.get("AIPYAPP_LANG", "zh")
+    set_lang(lang)
+    conf.lang = lang
+    conf.role = "aipy"
+    conf.max_rounds = int(os.environ.get("AIPYAPP_MAX_ROUNDS", "32"))
+    conf.timeout = 0
+    conf.share_result = False
+    conf.diagnose = {"enabled": False}
+    conf.skills = {"enabled": True}
+    conf.config_manager = config_manager
 
-    # LLM Provider: 优先环境变量, 其次 AiPyPro 配置
+    # LLM Provider: 直接使用 AiPyPro 已有配置, 环境变量可覆盖
     provider_env = os.environ.get("AIPYAPP_PROVIDER", "")
     if provider_env:
         try:
             provider = json.loads(provider_env)
         except json.JSONDecodeError:
             provider = {"name": "trustoken", "type": "trust", "api_key": provider_env}
-    else:
-        provider = settings.get("provider",
-            {"name": "trustoken", "type": "trust", "api_key": "xyz"})
-
-    settings["llm"] = {
-        provider.get("name", "trustoken"): {
-            **provider,
-            "enable": True,
-            "default": True,
+        conf.llm = {
+            provider.get("name", "trustoken"): {
+                **provider,
+                "enable": True,
+                "default": True,
+            }
         }
-    }
+    elif not conf.get("llm"):
+        raise RuntimeError(
+            "未找到 AiPyPro LLM 配置。\n"
+            "请在 AiPyPro 中先配置 LLM Provider，或设置 AIPYAPP_PROVIDER 环境变量。\n"
+            "示例: AIPYAPP_PROVIDER='{\"name\":\"deepseek\",\"type\":\"openai\",\"api_key\":\"sk-xxx\",\"base_url\":\"https://api.deepseek.com/v1\",\"model\":\"deepseek-chat\"}'"
+        )
 
     # MCP (不使用 sys MCP)
-    settings["mcp"] = {"sys_mcp_enabled": False}
+    conf.mcp = {"sys_mcp_enabled": False}
 
     # 环境变量注入
-    envs = settings.get("environ", {})
+    envs = conf.get("environ", {})
     for name, value in envs.items():
         os.environ[name] = str(value)
 
-    return settings
+    return conf
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +655,8 @@ def _run_task(instruction: str, mode: str, cwd: str) -> str:
 
     由 asyncio.to_thread() 调用, 不阻塞 MCP 事件循环。
     """
+    import io
+
     _init_aipy()
 
     tm = _aipy_imports["tm"]
@@ -670,6 +670,10 @@ def _run_task(instruction: str, mode: str, cwd: str) -> str:
     target_cwd = Path(cwd).expanduser().resolve() if cwd else tm.cwd
     if target_cwd.exists():
         os.chdir(str(target_cwd))
+
+    # 重定向 stdout，防止 AiPyPro 内部 print() 破坏 MCP JSON-RPC 帧
+    _saved_stdout = sys.stdout
+    sys.stdout = io.StringIO()
 
     result_parts: list[str] = []
 
@@ -723,10 +727,21 @@ def _run_task(instruction: str, mode: str, cwd: str) -> str:
         import traceback
         result_parts.append(f"[ERROR] 任务执行异常:\n{traceback.format_exc()}")
 
+    finally:
+        # 恢复 stdout，收集被 AiPyPro 内部 print() 捕获的输出
+        _captured = sys.stdout
+        sys.stdout = _saved_stdout
+
     # 合并结果
     display_text = MCPDisplayPlugin.get_text(task_id)
     if display_text:
         result_parts.append(display_text)
+
+    # 附加 AiPyPro 内部 print 输出（如有）
+    if hasattr(_captured, 'getvalue'):
+        leaked = _captured.getvalue().strip()
+        if leaked:
+            result_parts.append(leaked)
 
     final = "\n\n".join(filter(None, result_parts)).strip()
     return final or "任务执行完成（无输出）"
